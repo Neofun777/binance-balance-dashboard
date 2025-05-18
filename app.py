@@ -210,7 +210,7 @@ if page == "Add / Edit Sources":
             label = st.text_input("Label", key="lab2")
             chain = st.selectbox("Chain", ("ETH", "SOL", "BTC"))
             addr = st.text_input("Address")
-            ok2 = st.form_submit_button("Save", key="sav2")
+            ok2 = st.form_submit_button("Save")
         if ok2 and label and addr:
             cfg.setdefault("addresses", {})[label] = {"CHAIN": chain, "ADDRESS": addr}
             save_config(cfg)
