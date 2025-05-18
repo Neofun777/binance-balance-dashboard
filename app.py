@@ -136,17 +136,39 @@ def fetch_eth(addr: str, debank_key: str | None) -> List[Dict]:
 # -----------------------------------------------------------------------------
 
 def fetch_sol(addr: str) -> List[Dict]:
-    r = requests.get(f"{API_SOLSCAN}/account/tokens?account={addr}", timeout=15)
-    r.raise_for_status()
-    tokens = r.json()
+    """Fetch SPL‑токены через Solscan. Некоторые адреса отдают 404 на старом
+    эндпоинте (?account=). Пробуем пару вариантов и игнорируем 404 как «пусто»."""
+    variants = [
+        f"{API_SOLSCAN}/account/tokens?account={addr}",
+        f"{API_SOLSCAN}/account/tokens?address={addr}",  # новый формат
+    ]
+    tokens = None
+    for url in variants:
+        r = requests.get(url, timeout=15)
+        if r.status_code == 404:
+            continue  # попробуем другой вариант
+        r.raise_for_status()
+        tokens = r.json()
+        break
+    if tokens is None:
+        return []  # ничего не нашли
+
     out = []
     for t in tokens:
-        lamports = int(t["tokenAmount"]["amount"])
-        dec = t["tokenAmount"].get("decimals", 0)
-        amt = lamports / (10 ** dec) if dec else 0
+        try:
+            lamports = int(t["tokenAmount"]["amount"])
+            dec = t["tokenAmount"].get("decimals", 0)
+            amt = lamports / (10 ** dec) if dec else 0
+        except (KeyError, ValueError):
+            continue
         if amt:
-            sym = t.get("tokenSymbol") or t["mintAddress"][:6]
-            out.append({"asset": sym, "amount": amt, "usd": amt * price_usdt(sym), "src": "SOL"})
+            sym = t.get("tokenSymbol") or t.get("mintAddress", "")[:6]
+            out.append({
+                "asset": sym,
+                "amount": amt,
+                "usd": amt * price_usdt(sym),
+                "src": "SOL",
+            })
     return out
 
 # -----------------------------------------------------------------------------
