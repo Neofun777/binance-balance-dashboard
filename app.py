@@ -66,10 +66,11 @@ def load_config() -> Dict:
 
 
 def save_config(cfg: Dict):
+    """Write config to disk; on failure show error but keep app alive."""
     try:
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception as e:
-        st.error(f"Failed to save config: {e}")(json.dumps(cfg, indent=2))
+        st.error(f"Failed to save config: {e}")
 
 # -----------------------------------------------------------------------------
 # Price helper with cache (USD)
