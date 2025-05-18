@@ -1,193 +1,290 @@
 #!/usr/bin/env python3
 """
-Binance Balance Dashboard – Streamlit Community Cloud ready 🏄‍♀️
-=============================================================
+Crypto Balance Dashboard – config.json persistence
+=================================================
 
-* Три «страницы» в одном файле (`sidebar.selectbox`):
-  1. **Dashboard** – суммарная сводка по всем аккаунтам.
-  2. **Accounts** – детальные балансы каждого аккаунта.
-  3. **Add Keys** – форма для ввода/тестирования API‑ключей прямо в браузере.
-
-* **Хранилище ключей**
-  - Во время сессии: `st.session_state["accounts"]`.
-  - Постоянно на Cloud: секция `[accounts]` в `Secrets`. На странице «Add Keys» после добавления выводится TOML‑сниппет, который можно скопировать в Settings → Secrets.
-
-* **Зависимости**: `streamlit`, `requests`.
-
-Размещаешь репозиторий на GitHub → Deploy to Streamlit Community Cloud → в "Secrets" добавляешь блок `[accounts]` → Profit.
+* Хранит Binance API‑ключи и on‑chain адреса в **config.json** рядом с
+  приложением. Конфигурация доступна для редактирования через страницу
+  **Add / Edit Sources**.
+* Иллюстрация структуры файла:
+  ```json
+  {
+    "accounts": {
+      "Sub1": {"API_KEY": "…", "API_SECRET": "…"}
+    },
+    "addresses": {
+      "MyETH": {"CHAIN": "ETH", "ADDRESS": "0x…"}
+    }
+  }
+  ```
+* При первом запуске, если файла нет, создаётся пустой.
+* Все изменения из веб‑формы сразу пишутся в файл, так что они
+  сохраняются между рестартами контейнера Streamlit Cloud.
+* **Внимание:** ключи лежат в открытом виде на файловой системе контейнера.
+  Для публичных развёртываний лучше держать экземпляр приватным.
 """
 
-import time
-import hmac
+from __future__ import annotations
+
 import hashlib
+import hmac
+import json
+import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List
 
 import requests
 import streamlit as st
 
-API_BASE = "https://api.binance.com"
+# -----------------------------------------------------------------------------
+# Constants & file paths
+# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+API_BINANCE = "https://api.binance.com"
+API_DEBANK = "https://openapi.debank.com"
+API_SOLSCAN = "https://public-api.solscan.io"
+API_BLOCKCYPHER = "https://api.blockcypher.com/v1/btc/main"
 
 # -----------------------------------------------------------------------------
-# Low‑level Binance helpers
+# Config helpers
 # -----------------------------------------------------------------------------
 
-def _timestamp_ms() -> int:
-    return int(time.time() * 1000)
+def load_config() -> Dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError:
+            st.error("config.json is corrupted → resetting")
+    return {"accounts": {}, "addresses": {}}
 
 
-def _sign(query_string: str, secret: str) -> str:
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-
-
-def _call_binance(endpoint: str, key: str, secret: str):
-    qs = urllib.parse.urlencode({"timestamp": _timestamp_ms()})
-    signature = _sign(qs, secret)
-    url = f"{API_BASE}{endpoint}?{qs}&signature={signature}"
-    headers = {"X-Mbx-ApiKey": key, "Accept": "application/json"}
-    r = requests.get(url, headers=headers, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
+def save_config(cfg: Dict):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 # -----------------------------------------------------------------------------
-# Price cache (USDT‑пары) – для быстрой грубой оценки портфеля
+# Price helper with cache (USD)
 # -----------------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
-def get_price_usdt(asset: str) -> float:
+def price_usdt(asset: str) -> float:
     if asset.upper() in ("USDT", "BUSD", "FDUSD"):
         return 1.0
     symbol = asset.upper() + "USDT"
     try:
-        r = requests.get(f"{API_BASE}/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
+        r = requests.get(f"{API_BINANCE}/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
     except Exception:
-        return 0.0  # неизвестная пара – вернём 0
-
+        return 0.0
 
 # -----------------------------------------------------------------------------
-# Балансы одного аккаунта
+# Binance functions
 # -----------------------------------------------------------------------------
 
-@lru_cache(maxsize=32)
-def fetch_balances(api_key: str, api_sec: str):
-    data = _call_binance("/api/v3/account", api_key, api_sec)
-    balances = []
+def _ts() -> int:
+    return int(time.time() * 1000)
+
+def _sign(qs: str, secret: str) -> str:
+    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+def fetch_binance(key: str, secret: str) -> List[Dict]:
+    qs = urllib.parse.urlencode({"timestamp": _ts()})
+    url = f"{API_BINANCE}/api/v3/account?{qs}&signature={_sign(qs, secret)}"
+    r = requests.get(url, headers={"X-Mbx-ApiKey": key}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    out = []
     for b in data.get("balances", []):
-        free = float(b["free"])
-        locked = float(b["locked"])
-        total = free + locked
-        if total > 0:
-            balances.append({
-                "asset": b["asset"],
-                "free": free,
-                "locked": locked,
-                "total": total,
-                "usd": total * get_price_usdt(b["asset"]),
+        tot = float(b["free"]) + float(b["locked"])
+        if tot:
+            sym = b["asset"]
+            out.append({
+                "asset": sym,
+                "amount": tot,
+                "usd": tot * price_usdt(sym),
+                "src": "Binance",
             })
-    return balances
-
-
-# -----------------------------------------------------------------------------
-# Streamlit UI helpers
-# -----------------------------------------------------------------------------
-
-st.set_page_config(page_title="Binance Balances", layout="wide", page_icon="💰")
-
-# Bootstrap session_state with secrets
-if "accounts" not in st.session_state:
-    st.session_state["accounts"] = {}
-    if "accounts" in st.secrets:
-        for label, creds in st.secrets["accounts"].items():
-            st.session_state.accounts[label] = {
-                "API_KEY": creds["API_KEY"],
-                "API_SECRET": creds["API_SECRET"],
-            }
-
-page = st.sidebar.selectbox("Навигация", ("Dashboard", "Accounts", "Add Keys"))
+    return out
 
 # -----------------------------------------------------------------------------
-# Page: Add Keys
+# ETH via DeBank
 # -----------------------------------------------------------------------------
 
-if page == "Add Keys":
-    st.header("➕ Add Sub‑Account")
-    with st.form("add_sub"):
-        label = st.text_input("Label (Sub Name)")
-        api_key = st.text_input("API Key", type="password")
-        api_sec = st.text_input("Secret Key", type="password")
-        submitted = st.form_submit_button("Save (session)")
-    if submitted and label and api_key and api_sec:
-        st.session_state.accounts[label] = {"API_KEY": api_key, "API_SECRET": api_sec}
-        st.success(f"{label} добавлен, можно тестировать сразу.")
-        st.markdown("**Чтобы сохранить навсегда:** скопируй блок ниже в _Secrets_ на Streamlit Cloud → перезапусти app.")
-        toml = f"""[accounts.{label}]
-API_KEY = \"{api_key}\"
-API_SECRET = \"{api_sec}\""""""
-        st.code(toml, language="toml")
-
-    if st.session_state.accounts:
-        st.subheader("Текущие аккаунты (session + secrets)")
-        table = [{"label": k, "key": "•" * 6, "secret": "•" * 6} for k in st.session_state.accounts]
-        st.table(table)
-    else:
-        st.info("Пока нет ни одного аккаунта.")
+def fetch_eth(addr: str, debank_key: str | None) -> List[Dict]:
+    headers = {"accept": "application/json"}
+    if debank_key:
+        headers["AccessKey"] = debank_key
+    r = requests.get(f"{API_DEBANK}/v1/user/token_list?id={addr}&chain_id=eth", headers=headers, timeout=15)
+    r.raise_for_status()
+    tokens = r.json()
+    out = []
+    for t in tokens:
+        amt = t.get("amount", 0)
+        if amt:
+            sym = t.get("symbol", t["id"])
+            price = t.get("price", price_usdt(sym))
+            out.append({"asset": sym, "amount": amt, "usd": amt * price, "src": "ETH"})
+    return out
 
 # -----------------------------------------------------------------------------
-# Page: Dashboard (aggregate)
+# SOL via Solscan
 # -----------------------------------------------------------------------------
 
+def fetch_sol(addr: str) -> List[Dict]:
+    r = requests.get(f"{API_SOLSCAN}/account/tokens?account={addr}", timeout=15)
+    r.raise_for_status()
+    tokens = r.json()
+    out = []
+    for t in tokens:
+        lamports = int(t["tokenAmount"]["amount"])
+        dec = t["tokenAmount"].get("decimals", 0)
+        amt = lamports / (10 ** dec) if dec else 0
+        if amt:
+            sym = t.get("tokenSymbol") or t["mintAddress"][:6]
+            out.append({"asset": sym, "amount": amt, "usd": amt * price_usdt(sym), "src": "SOL"})
+    return out
+
+# -----------------------------------------------------------------------------
+# BTC via BlockCypher
+# -----------------------------------------------------------------------------
+
+def fetch_btc(addr: str) -> List[Dict]:
+    r = requests.get(f"{API_BLOCKCYPHER}/addrs/{addr}/balance", timeout=10)
+    r.raise_for_status()
+    sat = r.json().get("balance", 0)
+    btc = sat / 1e8
+    return [{"asset": "BTC", "amount": btc, "usd": btc * price_usdt("BTC"), "src": "BTC"}]
+
+# -----------------------------------------------------------------------------
+# Streamlit app
+# -----------------------------------------------------------------------------
+
+st.set_page_config("Crypto Dashboard", "💰", layout="wide")
+
+if "cfg" not in st.session_state:
+    st.session_state.cfg = load_config()
+
+debank_key = st.secrets.get("DEBANK_KEY", None)  # опционально из Secrets
+
+page = st.sidebar.selectbox("Page", ("Dashboard", "Accounts", "Add / Edit Sources"))
+
+cfg = st.session_state.cfg  # shortcut
+
+# -----------------------------------------------------------------------------
+# Add / Edit page
+# -----------------------------------------------------------------------------
+if page == "Add / Edit Sources":
+    st.header("🔧 Manage Sources")
+    tab1, tab2 = st.tabs(["Binance", "Addresses"])
+
+    with tab1:
+        st.subheader("Add Binance Sub‑Account")
+        with st.form("add_bin"):
+            label = st.text_input("Label")
+            key = st.text_input("API Key", type="password")
+            sec = st.text_input("Secret", type="password")
+            ok = st.form_submit_button("Save")
+        if ok and label and key and sec:
+            cfg.setdefault("accounts", {})[label] = {"API_KEY": key, "API_SECRET": sec}
+            save_config(cfg)
+            st.success("Saved")
+
+        if cfg.get("accounts"):
+            st.write("### Current accounts")
+            for l in list(cfg["accounts"].keys()):
+                col1, col2 = st.columns((4,1))
+                col1.write(l)
+                if col2.button("❌", key=f"delacc_{l}"):
+                    del cfg["accounts"][l]
+                    save_config(cfg)
+                    st.experimental_rerun()
+
+    with tab2:
+        st.subheader("Add Address")
+        with st.form("add_addr"):
+            label = st.text_input("Label", key="lab2")
+            chain = st.selectbox("Chain", ("ETH", "SOL", "BTC"))
+            addr = st.text_input("Address")
+            ok2 = st.form_submit_button("Save", key="sav2")
+        if ok2 and label and addr:
+            cfg.setdefault("addresses", {})[label] = {"CHAIN": chain, "ADDRESS": addr}
+            save_config(cfg)
+            st.success("Saved")
+
+        if cfg.get("addresses"):
+            st.write("### Current addresses")
+            for l in list(cfg["addresses"].keys()):
+                col1, col2 = st.columns((4,1))
+                col1.write(f"{l} ({cfg['addresses'][l]['CHAIN']})")
+                if col2.button("❌", key=f"deladdr_{l}"):
+                    del cfg["addresses"][l]
+                    save_config(cfg)
+                    st.experimental_rerun()
+
+# -----------------------------------------------------------------------------
+# Dashboard page
+# -----------------------------------------------------------------------------
 elif page == "Dashboard":
-    st.header("📊 Dashboard – Сводка по всем аккаунтам")
-    if not st.session_state.accounts:
-        st.warning("Добавь хотя бы один аккаунт на странице **Add Keys**.")
-        st.stop()
+    st.header("📊 Aggregated Dashboard")
+    agg: Dict[str, float] = {}
 
-    agg = {}
-    total_usd = 0.0
-    for label, creds in st.session_state.accounts.items():
+    # Binance
+    for lab, cred in cfg.get("accounts", {}).items():
         try:
-            bals = fetch_balances(creds["API_KEY"], creds["API_SECRET"])
+            for b in fetch_binance(cred["API_KEY"], cred["API_SECRET"]):
+                agg[b["asset"]] = agg.get(b["asset"], 0) + b["usd"]
         except Exception as e:
-            st.error(f"{label}: {e}")
-            continue
-        for b in bals:
-            a = b["asset"]
-            if a not in agg:
-                agg[a] = 0.0
-            agg[a] += b["total"]
-        total_usd += sum(x["usd"] for x in bals)
+            st.error(f"{lab}: {e}")
 
-    col1, col2 = st.columns(2)
-    col1.metric("Активов", len(agg))
-    col2.metric("Примерно USD", f"{total_usd:,.2f}")
+    # Addresses
+    for lab, info in cfg.get("addresses", {}).items():
+        try:
+            if info["CHAIN"] == "ETH":
+                toks = fetch_eth(info["ADDRESS"], debank_key)
+            elif info["CHAIN"] == "SOL":
+                toks = fetch_sol(info["ADDRESS"])
+            else:
+                toks = fetch_btc(info["ADDRESS"])
+            for b in toks:
+                agg[b["asset"]] = agg.get(b["asset"], 0) + b["usd"]
+        except Exception as e:
+            st.error(f"{lab}: {e}")
 
-    # Таблица агрегированных балансов
-    rows = [{"Asset": a, "Total": t, "≈USD": t * get_price_usdt(a)} for a, t in agg.items()]
-    rows.sort(key=lambda r: r["≈USD"], reverse=True)
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    total = sum(agg.values())
+    st.metric("≈ Total USD", f"{total:,.2f}")
+    rows = [{"Asset": a, "USD": v} for a, v in sorted(agg.items(), key=lambda x: x[1], reverse=True)]
+    st.dataframe(rows, hide_index=True, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# Page: Accounts (per‑account view)
+# Accounts detailed page
 # -----------------------------------------------------------------------------
+else:
+    st.header("🗂 Detailed Balances")
 
-elif page == "Accounts":
-    st.header("🗂 Балансы по аккаунтам")
-    if not st.session_state.accounts:
-        st.warning("Добавь хотя бы один аккаунт на странице **Add Keys**.")
-        st.stop()
-
-    for label, creds in st.session_state.accounts.items():
-        with st.expander(label, expanded=False):
+    for lab, cred in cfg.get("accounts", {}).items():
+        with st.expander(f"Binance – {lab}"):
             try:
-                bals = fetch_balances(creds["API_KEY"], creds["API_SECRET"])
+                data = fetch_binance(cred["API_KEY"], cred["API_SECRET"])
+                st.dataframe(data, hide_index=True, use_container_width=True)
             except Exception as e:
                 st.error(str(e))
-                continue
-            if not bals:
-                st.write("Пусто.")
-                continue
-            st.dataframe(bals, hide_index=True, use_container_width=True)
+
+    for lab, info in cfg.get("addresses", {}).items():
+        with st.expander(f"{info['CHAIN']} – {lab}"):
+            try:
+                if info["CHAIN"] == "ETH":
+                    data = fetch_eth(info["ADDRESS"], debank_key)
+                elif info["CHAIN"] == "SOL":
+                    data = fetch_sol(info["ADDRESS"])
+                else:
+                    data = fetch_btc(info["ADDRESS"])
+                st.dataframe(data, hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.error(str(e))
+
+st.caption("Data cached 5 min • File‑based config.json persistence • Use at your own risk")
