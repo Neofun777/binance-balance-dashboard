@@ -42,9 +42,14 @@ import streamlit as st
 # -----------------------------------------------------------------------------
 # Constants & file paths
 # -----------------------------------------------------------------------------
-# save config in writable home dir on Streamlit Cloud
-BASE_DIR = Path.home() / ".crypto_dashboard"
-BASE_DIR.mkdir(exist_ok=True)
+# choose writable dir for config
+try:
+    BASE_DIR = Path.home() / ".crypto_dashboard"
+    BASE_DIR.mkdir(exist_ok=True)
+except PermissionError:
+    # fallback to /tmp if $HOME is read‑only (rare on Streamlit Cloud)
+    BASE_DIR = Path("/tmp/crypto_dashboard")
+    BASE_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 
 API_BINANCE = "https://api.binance.com"
