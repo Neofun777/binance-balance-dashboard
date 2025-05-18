@@ -42,7 +42,9 @@ import streamlit as st
 # -----------------------------------------------------------------------------
 # Constants & file paths
 # -----------------------------------------------------------------------------
-BASE_DIR = Path(__file__).parent
+# save config in writable home dir on Streamlit Cloud
+BASE_DIR = Path.home() / ".crypto_dashboard"
+BASE_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = BASE_DIR / "config.json"
 
 API_BINANCE = "https://api.binance.com"
@@ -64,7 +66,10 @@ def load_config() -> Dict:
 
 
 def save_config(cfg: Dict):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    except Exception as e:
+        st.error(f"Failed to save config: {e}")(json.dumps(cfg, indent=2))
 
 # -----------------------------------------------------------------------------
 # Price helper with cache (USD)
